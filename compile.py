@@ -263,8 +263,11 @@ class Compiler:
         # early never reaches bar.sync and the rest of the block waits forever.
         extents = [self.int_expr(a.extent) for a in s.axes]
         cells = math.prod(extents)
-        threads = math.prod(self.launch["grid"]) * math.prod(self.launch["block"])
-        if threads > cells:
+        # Without meta.json the launch is unknown: always guard. Safe, since with
+        # exactly one thread per cell the guard never fires.
+        grid, block = self.launch.get("grid"), self.launch.get("block")
+        threads = math.prod(grid) * math.prod(block) if grid and block else None
+        if threads is None or threads > cells:
             p = self.regs.new("p")
             self.op("setp.ge.s32", p, gid, cells)
             self.bra("DONE", f"@{p}")
@@ -508,13 +511,38 @@ def accums_of(stmts):
 
 def load(path):
     path = Path(path)
-    graph = Graph.from_dict(json.loads(path.read_text()))
+    raw = json.loads(path.read_text())
+    graph = Graph.from_dict(raw)
     (kernel,) = [n.op for n in graph.nodes.values() if type(n.op).__name__ == "KernelOp"]
 
     # Param order comes from meta.json, not from the IR node.
-    meta = json.loads((path.parent / "meta.json").read_text())
-    (launch,) = [k for k in meta["kernels"] if k["entry"] == kernel.name]
-    return kernel, launch
+    meta_path = path.parent / "meta.json"
+    if meta_path.exists():
+        meta = json.loads(meta_path.read_text())
+        (launch,) = [k for k in meta["kernels"] if k["entry"] == kernel.name]
+        return kernel, launch
+    return kernel, launch_from_ir(raw, kernel)
+
+
+# Fallback when meta.json is missing: inputs then outputs (true of every open
+# problem), shapes from the graph, launch unknown.
+def launch_from_ir(raw, kernel):
+    (node,) = [n for n in raw["nodes"].values() if n["op"] == "KernelOp"]
+    tensors = {t["name"]: t for n in raw["nodes"].values() for t in n.get("outputs", [])}
+    order = node["inputs"] + [t["name"] for t in node["outputs"]]
+    args = [dict(name=a, dtype=tensors[a]["dtype"], shape=tensors[a]["shape"] or [1]) for a in order]
+
+    # Static .shared stops at 48 KB: above, the kernel needs the dynamic pool.
+    smem = sum(NBYTES[SMEM_DTYPE[s.dtype]] * math.prod(int(x) for x in s.extents)
+               for s in walk(kernel.body) if type(s).__name__ == "Smem")
+    return dict(arg_order=order, args=args, smem_bytes=smem if smem > 48 * 1024 else 0)
+
+
+def walk(stmts):
+    for s in stmts:
+        yield s
+        for field in ("body", "else_body"):
+            yield from walk(getattr(s, field, None) or ())
 
 
 if __name__ == "__main__":
