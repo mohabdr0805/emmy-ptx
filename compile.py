@@ -20,6 +20,8 @@ INT_OPS = {"+": "add.s32", "-": "sub.s32", "*": "mul.lo.s32",
 # Lambdas, so only the requested op is evaluated (0 // 0 otherwise).
 FOLD = {"+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
         "/": lambda a, b: a // b, "//": lambda a, b: a // b, "%": lambda a, b: a % b}
+CMP_FOLD = {"==": lambda a, b: a == b, "!=": lambda a, b: a != b, "<": lambda a, b: a < b,
+            "<=": lambda a, b: a <= b, ">": lambda a, b: a > b, ">=": lambda a, b: a >= b}
 CMP_OPS = {"==": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
 # Comparisons write a predicate. neu is true on NaN, like numpy's !=.
 F32_CMP = {"greater": "gt", "greater_equal": "ge", "less": "lt", "less_equal": "le",
@@ -59,6 +61,7 @@ class Compiler:
         self.regs = Regs()
         self.lines = []
         self.smem = []
+        self.pool = 0                       # bytes used in the dynamic smem pool
         self.n_labels = 0
         self.env = {}                       # IR name -> register, or int if known
         self.base = {}                      # buffer -> base address register
@@ -116,6 +119,15 @@ class Compiler:
             return self.env[e.name]
         if t == "BinaryExpr" and e.op in INT_OPS:
             return self.int_bin(e.op, self.int_expr(e.left), self.int_expr(e.right))
+        if t == "TernaryExpr":
+            # cond ? a : b, a select, no branch. Folded when the condition is known.
+            p = self.pred_expr(e.cond)
+            a, b = self.int_expr(e.if_true), self.int_expr(e.if_false)
+            if isinstance(p, bool):
+                return a if p else b
+            r = self.regs.new("r")
+            self.op("selp.s32", r, a, b, p)
+            return r
         raise NotImplementedError(f"int expression {e}")
 
     def pred_expr(self, e):
@@ -123,6 +135,8 @@ class Compiler:
             raise NotImplementedError(f"predicate {e}")
 
         a, b = self.int_expr(e.left), self.int_expr(e.right)
+        if isinstance(a, int) and isinstance(b, int):
+            return CMP_FOLD[e.op](a, b)
         if isinstance(a, int):
             a = self.mov_int(a)
 
@@ -291,14 +305,29 @@ class Compiler:
             self.st(s.output, (reg, off), vals)
 
     def stmt_StridedLoop(self, s):
-        # Accumulators start at the op's identity, before the loop.
-        for acc in accums_of(s.body):
-            init = self.env[acc.base] if acc.base else f32_imm(acc.op.identity)
-            self.op("mov.f32", self.reg_of(acc.name), init)
+        end = s.end if s.end is not None else s.axis.extent
+        self.loop(s, self.int_expr(s.start), self.int_expr(end), self.int_expr(s.step))
 
-        end = self.int_expr(s.end if s.end is not None else s.axis.extent)
+    def stmt_Loop(self, s):
+        self.loop(s, 0, self.int_expr(s.axis.extent), 1)
+
+    def loop(self, s, start, end, step):
+        # seed: accumulators start at the op's identity here. Not seeded = they
+        # were set once by Init outside, e.g. the K loop of a matmul.
+        if s.seed:
+            for acc in accums_of(s.body):
+                self.op("mov.f32", self.reg_of(acc.name), f32_imm(acc.op.identity))
+
+        # Static bounds + unroll: the axis is a Python int in each copy, so the
+        # indices fold into immediate offsets.
+        if s.unroll and all(isinstance(v, int) for v in (start, end, step)):
+            for i in range(start, end, step):
+                self.env[s.axis.name] = i
+                self.body(s.body)
+            return
+
         a = self.regs.new("r")
-        self.op("mov.s32", a, self.int_expr(s.start))
+        self.op("mov.s32", a, start)
         self.env[s.axis.name] = a
 
         top, done = self.label("LOOP"), self.label("LOOP_END")
@@ -309,13 +338,22 @@ class Compiler:
 
         self.body(s.body)
 
-        self.op("add.s32", a, a, self.int_expr(s.step))
+        self.op("add.s32", a, a, step)
         self.bra(top)
         self.place(done)
 
+    # acc = acc op value, or base op value when the IR already rescaled acc
+    # (online softmax: base = acc * alpha).
     def stmt_Accum(self, s):
         acc = self.env[s.name]
-        self.elementwise(s.op.name, acc, [acc, self.env[s.value]])
+        left = self.env[s.base] if s.base else acc
+        self.elementwise(s.op.name, acc, [left, self.env[s.value]])
+
+    def stmt_Let(self, s):
+        if s.dtype.name in ("f32", "f16"):
+            self.op("mov.f32", self.reg_of(s.name), f32_imm(s.value.value))
+        else:
+            self.env[s.name] = self.int_expr(s.value)
 
     def stmt_WarpShuffle(self, s):
         # XOR butterfly: every lane ends with the result, not only lane 0.
@@ -327,19 +365,59 @@ class Compiler:
             self.body(s.combine_states)
             step //= 2
 
+    def stmt_Init(self, s):
+        self.op("mov.f32", self.reg_of(s.name), f32_imm(s.identity))
+
+    def stmt_CpAsyncCopy(self, s):
+        if str(s.swizzle) != "NONE":
+            raise NotImplementedError(f"cp.async swizzle {s.swizzle}")
+
+        # Destination = the tile's corner + this thread's offset in it.
+        dst = self.flat_index(s.smem, s.smem_index)
+        if s.lane_index:
+            dst = self.int_bin("+", dst, self.flat_index(s.smem, s.lane_index))
+        sreg, soff = self.address(s.smem, dst)
+        greg, goff = self.address(s.src, self.flat_index(s.src, s.src_index))
+
+        # .cg (L2 only) exists for 16 bytes only, .ca otherwise.
+        cache = "cg" if s.nbytes == 16 else "ca"
+        self.op(f"cp.async.{cache}.shared.global", f"[{sreg}+{soff}]", f"[{greg}+{goff}]", s.nbytes)
+
+    def stmt_CpAsyncCommit(self, s):
+        self.lines.append("        cp.async.commit_group;")
+
+    def stmt_CpAsyncWait(self, s):
+        self.op("cp.async.wait_group", s.group)
+
     def stmt_Smem(self, s):
         extents = [self.int_expr(e) for e in s.extents]
         self.dtype[s.name] = SMEM_DTYPE[s.dtype]
         nbytes = NBYTES[self.dtype[s.name]] * math.prod(extents)
-        self.smem.append(f".shared .align {max(s.align, 16)} .b8 {s.name}[{nbytes}];")
-
+        align = max(s.align, 16)
         self.shape[s.name] = extents
         self.space[s.name] = "shared"
         self.base[s.name] = self.regs.new("r")
-        self.op("mov.u32", self.base[s.name], s.name)
+
+        # Static .shared stops at 48 KB. meta.json gives a dynamic size when the
+        # kernel needs more: then every Smem is an offset in one extern pool.
+        if not self.launch.get("smem_bytes"):
+            self.smem.append(f".shared .align {align} .b8 {s.name}[{nbytes}];")
+            self.op("mov.u32", self.base[s.name], s.name)
+            return
+
+        if not self.smem:
+            self.smem.append(".extern .shared .align 16 .b8 smem_pool[];")
+        self.pool = -(-self.pool // align) * align
+        self.op("mov.u32", self.base[s.name], "smem_pool")
+        self.op("add.u32", self.base[s.name], self.base[s.name], self.pool)
+        self.pool += nbytes
 
     def stmt_Cond(self, s):
         p = self.pred_expr(s.cond)
+        if isinstance(p, bool):
+            self.body(s.body if p else s.else_body)
+            return
+
         skip, end = self.label("ELSE"), self.label("END_IF")
         self.bra(skip, f"@!{p}")
 
