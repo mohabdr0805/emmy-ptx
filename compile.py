@@ -1,7 +1,7 @@
 # Emmy Kernel IR -> PTX.
 #   python compile.py path/to/kernel.ir.json > out.ptx
 
-import json, math, struct, sys
+import contextlib, json, math, struct, sys
 from pathlib import Path
 
 from emmy.compiler.graph import Graph
@@ -14,9 +14,10 @@ F32_OPS = {
     "sqrt": "sqrt.rn.f32", "rsqrt": "rsqrt.approx.f32",
     "reciprocal": "rcp.rn.f32", "tanh": "tanh.approx.f32", "copy": "mov.f32",
 }
-# // is floor, div.s32 truncates: same result because indices are never negative.
+# Index arithmetic is unsigned: an index is never negative, so floor and trunc
+# agree and / and % by a power of 2 are a shift and a mask.
 INT_OPS = {"+": "add.s32", "-": "sub.s32", "*": "mul.lo.s32",
-           "/": "div.s32", "//": "div.s32", "%": "rem.s32"}
+           "/": "div.u32", "//": "div.u32", "%": "rem.u32"}
 # Lambdas, so only the requested op is evaluated (0 // 0 otherwise).
 FOLD = {"+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
         "/": lambda a, b: a // b, "//": lambda a, b: a // b, "%": lambda a, b: a % b}
@@ -64,6 +65,7 @@ class Compiler:
         self.pool = 0                       # bytes used in the dynamic smem pool
         self.n_labels = 0
         self.env = {}                       # IR name -> register, or int if known
+        self.memo = {}                      # (op, a, b) -> register already holding it
         self.base = {}                      # buffer -> base address register
         self.space = {}                     # buffer -> "global" or "shared"
         self.shape = {a["name"]: a["shape"] for a in launch["args"]}
@@ -98,9 +100,28 @@ class Compiler:
         if isinstance(a, int):
             a = self.mov_int(a)
 
+        # Same expression already computed on this path: reuse it.
+        key = (o, a, b)
+        if key in self.memo:
+            return self.memo[key]
+
         r = self.regs.new("r")
-        self.op(INT_OPS[o], r, a, b)
+        if o in ("/", "//", "%") and isinstance(b, int) and b > 0 and b & (b - 1) == 0:
+            if o == "%":
+                self.op("and.b32", r, a, b - 1)
+            else:
+                self.op("shr.u32", r, a, b.bit_length() - 1)
+        else:
+            self.op(INT_OPS[o], r, a, b)
+        self.memo[key] = r
         return r
+
+    # A value computed inside an if or a loop body is not there after it.
+    @contextlib.contextmanager
+    def scope(self):
+        saved = dict(self.memo)
+        yield
+        self.memo = saved
 
     def mov_int(self, v):
         r = self.regs.new("r")
@@ -163,15 +184,21 @@ class Compiler:
         if isinstance(flat, int):
             return self.base[buf], n * flat
 
+        key = ("addr", buf, flat)
+        if key not in self.memo:
+            self.memo[key] = self.address_reg(buf, flat, n)
+        return self.memo[key], 0
+
+    def address_reg(self, buf, flat, n):
         if self.space[buf] == "shared":
             a = self.regs.new("r")
             self.op("mad.lo.s32", a, flat, n, self.base[buf])
-            return a, 0
+            return a
 
         off, a = self.regs.new("rd"), self.regs.new("rd")
-        self.op("mul.wide.s32", off, flat, n)
+        self.op("mul.wide.u32", off, flat, n)
         self.op("add.s64", a, self.base[buf], off)
-        return a, 0
+        return a
 
     # dst / vals are f32 registers. f16 is converted on the way in and out.
     def ld(self, dst, buf, addr):
@@ -322,8 +349,10 @@ class Compiler:
                 self.op("mov.f32", self.reg_of(acc.name), f32_imm(acc.op.identity))
 
         # Static bounds + unroll: the axis is a Python int in each copy, so the
-        # indices fold into immediate offsets.
-        if s.unroll and all(isinstance(v, int) for v in (start, end, step)):
+        # indices fold into immediate offsets. Innermost loops only: unrolling a
+        # loop of loops multiplies the code and runs out of registers (a01).
+        innermost = not any(type(x).__name__ in ("Loop", "StridedLoop") for x in walk(s.body))
+        if s.unroll and innermost and all(isinstance(v, int) for v in (start, end, step)):
             for i in range(start, end, step):
                 self.env[s.axis.name] = i
                 self.body(s.body)
@@ -339,7 +368,8 @@ class Compiler:
         self.op("setp.ge.s32", p, a, end)
         self.bra(done, f"@{p}")
 
-        self.body(s.body)
+        with self.scope():
+            self.body(s.body)
 
         self.op("add.s32", a, a, step)
         self.bra(top)
@@ -424,12 +454,14 @@ class Compiler:
         skip, end = self.label("ELSE"), self.label("END_IF")
         self.bra(skip, f"@!{p}")
 
-        self.body(s.body)
+        with self.scope():
+            self.body(s.body)
 
         if s.else_body:
             self.bra(end)
             self.place(skip)
-            self.body(s.else_body)
+            with self.scope():
+                self.body(s.else_body)
             self.place(end)
         else:
             self.place(skip)
@@ -457,12 +489,13 @@ class Compiler:
             self.op("setp.lt.s32", p, tid, half)
             self.bra(skip, f"@!{p}")
 
-            for buf, st, sb in zip(s.bufs, s.state, s.state_b):
-                self.ld([self.reg_of(st)], buf, self.address(buf, tid))
-                self.ld([self.reg_of(sb)], buf, self.address(buf, self.int_bin("+", tid, half)))
-            self.body(s.combine_states)
-            for buf, st in zip(s.bufs, s.state):
-                self.st(buf, self.address(buf, tid), [self.env[st]])
+            with self.scope():
+                for buf, st, sb in zip(s.bufs, s.state, s.state_b):
+                    self.ld([self.reg_of(st)], buf, self.address(buf, tid))
+                    self.ld([self.reg_of(sb)], buf, self.address(buf, self.int_bin("+", tid, half)))
+                self.body(s.combine_states)
+                for buf, st in zip(s.bufs, s.state):
+                    self.st(buf, self.address(buf, tid), [self.env[st]])
 
             self.place(skip)
             self.op("bar.sync", *bar)
