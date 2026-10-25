@@ -31,6 +31,9 @@ PRED_OPS = {"logical_and": "and.pred", "logical_or": "or.pred", "logical_not": "
 # Buffers are stored in their own type, values are always computed in f32.
 NBYTES = {"f32": 4, "f16": 2}
 SMEM_DTYPE = {"float": "f32", "half": "f16"}
+# Partial unroll factor for long loops. Statements a partially unrolled body must not hold.
+UNROLL = 8
+BARRIER_STMTS = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve")
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
 
@@ -361,6 +364,27 @@ class Compiler:
         a = self.regs.new("r")
         self.op("mov.s32", a, start)
         self.env[s.axis.name] = a
+
+        # Long innermost loop: UNROLL copies per trip so that many loads are in
+        # flight, then the plain loop below does the tail. Not with barriers in
+        # the body: threads can run a different number of trips.
+        sync = any(type(x).__name__ in BARRIER_STMTS for x in walk(s.body))
+        if innermost and not sync and isinstance(step, int) and isinstance(end, int)                 and end // step >= 2 * UNROLL:
+            top, done = self.label("LOOP_X"), self.label("LOOP_X_END")
+            p = self.regs.new("p")
+            self.place(top)
+            self.op("setp.ge.s32", p, a, end - (UNROLL - 1) * step)
+            self.bra(done, f"@{p}")
+
+            with self.scope():
+                for k in range(UNROLL):
+                    self.env[s.axis.name] = self.int_bin("+", a, k * step)
+                    self.body(s.body)
+
+            self.op("add.s32", a, a, UNROLL * step)
+            self.bra(top)
+            self.place(done)
+            self.env[s.axis.name] = a
 
         top, done = self.label("LOOP"), self.label("LOOP_END")
         p = self.regs.new("p")
