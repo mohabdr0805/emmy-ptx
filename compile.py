@@ -14,9 +14,20 @@ F32_OPS = {
     "sqrt": "sqrt.rn.f32", "rsqrt": "rsqrt.approx.f32",
     "reciprocal": "rcp.rn.f32", "tanh": "tanh.approx.f32", "copy": "mov.f32",
 }
-INT_OPS = {"+": "add.s32", "-": "sub.s32", "*": "mul.lo.s32", "/": "div.s32", "%": "rem.s32"}
+# // is floor, div.s32 truncates: same result because indices are never negative.
+INT_OPS = {"+": "add.s32", "-": "sub.s32", "*": "mul.lo.s32",
+           "/": "div.s32", "//": "div.s32", "%": "rem.s32"}
+# Lambdas, so only the requested op is evaluated (0 // 0 otherwise).
+FOLD = {"+": lambda a, b: a + b, "-": lambda a, b: a - b, "*": lambda a, b: a * b,
+        "/": lambda a, b: a // b, "//": lambda a, b: a // b, "%": lambda a, b: a % b}
 CMP_OPS = {"==": "eq", "!=": "ne", "<": "lt", "<=": "le", ">": "gt", ">=": "ge"}
-NBYTES = {"f32": 4, "float": 4}
+# Comparisons write a predicate. neu is true on NaN, like numpy's !=.
+F32_CMP = {"greater": "gt", "greater_equal": "ge", "less": "lt", "less_equal": "le",
+           "equal": "eq", "not_equal": "neu"}
+PRED_OPS = {"logical_and": "and.pred", "logical_or": "or.pred", "logical_not": "not.pred"}
+# Buffers are stored in their own type, values are always computed in f32.
+NBYTES = {"f32": 4, "f16": 2}
+SMEM_DTYPE = {"float": "f32", "half": "f16"}
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
 
@@ -27,7 +38,7 @@ def f32_imm(x):
 
 
 class Regs:
-    KINDS = {"p": ".pred", "r": ".b32", "rd": ".b64", "f": ".f32"}
+    KINDS = {"p": ".pred", "h": ".b16", "r": ".b32", "rd": ".b64", "f": ".f32"}
 
     def __init__(self):
         self.count = {k: 0 for k in self.KINDS}
@@ -53,6 +64,7 @@ class Compiler:
         self.base = {}                      # buffer -> base address register
         self.space = {}                     # buffer -> "global" or "shared"
         self.shape = {a["name"]: a["shape"] for a in launch["args"]}
+        self.dtype = {a["name"]: a["dtype"] for a in launch["args"]}
 
     def op(self, opcode, *args):
         self.lines.append(f"        {opcode:<20}{', '.join(map(str, args))};")
@@ -71,7 +83,7 @@ class Compiler:
 
     def int_bin(self, o, a, b):
         if isinstance(a, int) and isinstance(b, int):
-            return {"+": a + b, "-": a - b, "*": a * b, "/": a // b, "%": a % b}[o]
+            return FOLD[o](a, b)
 
         # x + 0 and x * 1 come from the unrolled bodies.
         if (o in "+-" and b == 0) or (o == "*" and b == 1):
@@ -133,43 +145,78 @@ class Compiler:
 
     # Returns (register, byte offset). Shared addresses are 32-bit.
     def address(self, buf, flat):
+        n = NBYTES[self.dtype[buf]]
         if isinstance(flat, int):
-            return self.base[buf], 4 * flat
+            return self.base[buf], n * flat
 
         if self.space[buf] == "shared":
             a = self.regs.new("r")
-            self.op("mad.lo.s32", a, flat, 4, self.base[buf])
+            self.op("mad.lo.s32", a, flat, n, self.base[buf])
             return a, 0
 
         off, a = self.regs.new("rd"), self.regs.new("rd")
-        self.op("mul.wide.s32", off, flat, 4)
+        self.op("mul.wide.s32", off, flat, n)
         self.op("add.s64", a, self.base[buf], off)
         return a, 0
 
+    # dst / vals are f32 registers. f16 is converted on the way in and out.
     def ld(self, dst, buf, addr):
         reg, off = addr
-        self.op(f"ld.{self.space[buf]}.f32", dst, f"[{reg}+{off}]")
+        sp = self.space[buf]
+        if self.dtype[buf] == "f32":
+            vec = "" if len(dst) == 1 else f".v{len(dst)}"
+            self.op(f"ld.{sp}{vec}.f32", vec_regs(dst), f"[{reg}+{off}]")
+            return
 
-    def st(self, buf, addr, v):
+        h = [self.regs.new("h") for _ in dst]
+        vec = "" if len(h) == 1 else f".v{len(h)}"
+        self.op(f"ld.{sp}{vec}.b16", vec_regs(h), f"[{reg}+{off}]")
+        for d, x in zip(dst, h):
+            self.op("cvt.f32.f16", d, x)
+
+    def st(self, buf, addr, vals):
         reg, off = addr
-        self.op(f"st.{self.space[buf]}.f32", f"[{reg}+{off}]", v)
+        sp = self.space[buf]
+        vec = "" if len(vals) == 1 else f".v{len(vals)}"
+        if self.dtype[buf] == "f32":
+            self.op(f"st.{sp}{vec}.f32", f"[{reg}+{off}]", vec_regs(vals))
+            return
+
+        h = [self.regs.new("h") for _ in vals]
+        for x, v in zip(h, vals):
+            self.op("cvt.rn.f16.f32", x, v)
+        self.op(f"st.{sp}{vec}.b16", f"[{reg}+{off}]", vec_regs(h))
 
     # A name assigned again (accumulator, shuffle partner) keeps its register,
     # otherwise the new value is lost at the end of an if or a loop body.
-    def reg_of(self, name):
+    def reg_of(self, name, kind="f"):
         if name not in self.env:
-            self.env[name] = self.regs.new("f")
+            self.env[name] = self.regs.new(kind)
         return self.env[name]
 
     def elementwise(self, op, d, args):
         if op in F32_OPS:
             self.op(F32_OPS[op], d, *args)
+        elif op in F32_CMP:
+            self.op(f"setp.{F32_CMP[op]}.f32", d, *args)
+        elif op in PRED_OPS:
+            self.op(PRED_OPS[op], d, *args)
+        elif op == "where":
+            # Select, no branch: cond ? a : b.
+            cond, a, b = args
+            self.op("selp.f32", d, a, b, cond)
         elif op == "relu":
             self.op("max.f32", d, args[0], f32_imm(0.0))
         elif op in ("exp", "exp_fast"):
             # e^x = 2^(x * log2(e))
             self.op("mul.f32", d, args[0], f32_imm(LOG2E))
             self.op("ex2.approx.f32", d, d)
+        elif op == "sigmoid":
+            # 1 / (1 + e^-x). x -> -inf gives 1/inf = 0, no NaN.
+            self.op("mul.f32", d, args[0], f32_imm(-LOG2E))
+            self.op("ex2.approx.f32", d, d)
+            self.op("add.f32", d, d, f32_imm(1.0))
+            self.op("rcp.rn.f32", d, d)
         elif op == "log":
             self.op("lg2.approx.f32", d, args[0])
             self.op("mul.f32", d, d, f32_imm(LN2))
@@ -218,34 +265,30 @@ class Compiler:
         self.body(s.body)
 
     def stmt_Load(self, s):
-        assert s.dtype.name == "f32", s.dtype.name
-        dst = [self.reg_of(n) for n in s.names]
-        reg, off = self.address(s.input, self.flat_index(s.input, s.index))
-
         # Several names = consecutive values = one vector load.
-        if len(dst) == 1:
-            self.ld(dst[0], s.input, (reg, off))
-        else:
-            self.op(f"ld.{self.space[s.input]}.v{len(dst)}.f32", "{" + ", ".join(dst) + "}", f"[{reg}+{off}]")
+        dst = [self.reg_of(n) for n in s.names]
+        self.ld(dst, s.input, self.address(s.input, self.flat_index(s.input, s.index)))
 
     def stmt_Assign(self, s):
-        assert s.dtype is None or s.dtype.name == "f32", s.dtype
+        dtype = s.dtype.name if s.dtype else "f32"
+        assert dtype in ("f32", "f16", "bool"), dtype
         args = [self.env[a] for a in s.args]
-        self.elementwise(s.op.name, self.reg_of(s.name), args)
+
+        # A bool lives in a predicate register.
+        d = self.reg_of(s.name, "p" if dtype == "bool" else "f")
+        self.elementwise(s.op.name, d, args)
 
     def stmt_Write(self, s):
-        assert s.value_dtype.name == "f32", s.value_dtype.name
         vals = [self.env[v] for v in s.values]
         reg, off = self.address(s.output, self.flat_index(s.output, s.index))
 
         if s.atomic:
+            assert self.dtype[s.output] == "f32", self.dtype[s.output]
             for k, v in enumerate(vals):
                 self.op("red.global.add.f32", f"[{reg}+{off + 4 * k}]", v)
-        elif len(vals) == 1:
-            self.st(s.output, (reg, off), vals[0])
         else:
             # buf[i] = (v0, v1, v2, v3) = one vector store.
-            self.op(f"st.{self.space[s.output]}.v{len(vals)}.f32", f"[{reg}+{off}]", "{" + ", ".join(vals) + "}")
+            self.st(s.output, (reg, off), vals)
 
     def stmt_StridedLoop(self, s):
         # Accumulators start at the op's identity, before the loop.
@@ -286,7 +329,8 @@ class Compiler:
 
     def stmt_Smem(self, s):
         extents = [self.int_expr(e) for e in s.extents]
-        nbytes = NBYTES[s.dtype] * math.prod(extents)
+        self.dtype[s.name] = SMEM_DTYPE[s.dtype]
+        nbytes = NBYTES[self.dtype[s.name]] * math.prod(extents)
         self.smem.append(f".shared .align {max(s.align, 16)} .b8 {s.name}[{nbytes}];")
 
         self.shape[s.name] = extents
@@ -333,11 +377,11 @@ class Compiler:
             self.bra(skip, f"@!{p}")
 
             for buf, st, sb in zip(s.bufs, s.state, s.state_b):
-                self.ld(self.reg_of(st), buf, self.address(buf, tid))
-                self.ld(self.reg_of(sb), buf, self.address(buf, self.int_bin("+", tid, half)))
+                self.ld([self.reg_of(st)], buf, self.address(buf, tid))
+                self.ld([self.reg_of(sb)], buf, self.address(buf, self.int_bin("+", tid, half)))
             self.body(s.combine_states)
             for buf, st in zip(s.bufs, s.state):
-                self.st(buf, self.address(buf, tid), self.env[st])
+                self.st(buf, self.address(buf, tid), [self.env[st]])
 
             self.place(skip)
             self.op("bar.sync", *bar)
@@ -345,7 +389,7 @@ class Compiler:
 
         # Every thread reads the result.
         for buf, st in zip(s.bufs, s.state):
-            self.ld(self.env[st], buf, self.address(buf, 0))
+            self.ld([self.env[st]], buf, self.address(buf, 0))
 
     def compile(self):
         # Params are generic pointers, converted once.
@@ -367,6 +411,10 @@ class Compiler:
             *self.regs.decls(), "",
             *self.lines, "}", "",
         ])
+
+
+def vec_regs(regs):
+    return regs[0] if len(regs) == 1 else "{" + ", ".join(regs) + "}"
 
 
 # Accumulators of a loop body. A nested loop seeds its own.
