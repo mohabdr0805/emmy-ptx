@@ -36,6 +36,8 @@ UNROLL = 8
 BARRIER_STMTS = ("Sync", "CpAsyncCopy", "CpAsyncCommit", "CpAsyncWait", "WarpShuffle", "TreeHalve")
 LOG2E = 1.4426950408889634
 LN2 = 0.6931471805599453
+ERF_P = 0.3275911
+ERF_A = (0.254829592, -0.284496736, 1.421413741, -1.453152027, 1.061405429)
 
 
 # Exact bit pattern, no decimal rounding.
@@ -261,6 +263,27 @@ class Compiler:
             self.op("ex2.approx.f32", d, d)
             self.op("add.f32", d, d, f32_imm(1.0))
             self.op("rcp.rn.f32", d, d)
+        elif op == "erf":
+            # Abramowitz & Stegun 7.1.26, |error| < 1.5e-7. On |x|, sign put back.
+            ax, t, poly, e = (self.regs.new("f") for _ in range(4))
+            self.op("abs.f32", ax, args[0])
+            self.op("fma.rn.f32", t, ax, f32_imm(ERF_P), f32_imm(1.0))
+            self.op("rcp.rn.f32", t, t)
+
+            # Horner: t * (a1 + t * (a2 + t * (a3 + t * (a4 + t * a5))))
+            self.op("mov.f32", poly, f32_imm(ERF_A[4]))
+            for a in reversed(ERF_A[:4]):
+                self.op("fma.rn.f32", poly, poly, t, f32_imm(a))
+            self.op("mul.f32", poly, poly, t)
+
+            # e^(-x^2)
+            self.op("mul.f32", e, ax, ax)
+            self.op("mul.f32", e, e, f32_imm(-LOG2E))
+            self.op("ex2.approx.f32", e, e)
+
+            self.op("neg.f32", e, e)
+            self.op("fma.rn.f32", t, poly, e, f32_imm(1.0))
+            self.op("copysign.f32", d, args[0], t)
         elif op == "log":
             self.op("lg2.approx.f32", d, args[0])
             self.op("mul.f32", d, d, f32_imm(LN2))
@@ -369,7 +392,7 @@ class Compiler:
         # flight, then the plain loop below does the tail. Not with barriers in
         # the body: threads can run a different number of trips.
         sync = any(type(x).__name__ in BARRIER_STMTS for x in walk(s.body))
-        if innermost and not sync and isinstance(step, int) and isinstance(end, int)                 and end // step >= 2 * UNROLL:
+        if innermost and not sync and isinstance(step, int) and isinstance(end, int) and end // step >= 2 * UNROLL:
             top, done = self.label("LOOP_X"), self.label("LOOP_X_END")
             p = self.regs.new("p")
             self.place(top)
